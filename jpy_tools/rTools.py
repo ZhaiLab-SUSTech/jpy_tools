@@ -35,14 +35,17 @@ from tempfile import TemporaryDirectory
 import pickle
 import sys
 import os
-from .otherTools import Capturing
+from loguru import logger
+from .otherTools import Capturing, F
+# import pyarrow
+
+# pyarrow.Table.from_pandas(pd.DataFrame([1,2,3])) # this package should be imported before arrow(R)
 
 R = ro.r
-seo = importr("SeuratObject")
+# seo = importr("SeuratObject")
 rBase = importr("base")
 rUtils = importr("utils")
-importr("magrittr")
-# arrow = importr('arrow') # this package should be imported before pyarrow
+# importr("magrittr")
 
 
 def rcontext(func):
@@ -197,12 +200,18 @@ def py2r_disk(obj, check=False, *args, **kwargs):
         obj.obs["temp_barcodeName"] = obj.obs.index
         obj.write_h5ad(tpFile.name)
         objR = zellkonverter.readH5AD(tpFile.name, X_layer, reader="R")
+        dfR_obs = py2r(obj.obs)
+        dfR_var = py2r(obj.var)
         with ro.local_context() as rlc:
             rlc["objR"] = objR
+            rlc["dfR_obs"] = dfR_obs
+            rlc["dfR_var"] = dfR_var
             R(
                 """
             objR@rowRanges@partitioning@NAMES <- rowData(objR)$temp_featureName
             objR@colData@rownames <- colData(objR)$temp_barcodeName
+            objR@colData <- dfR_obs %>% DataFrame
+            objR@rowRanges@elementMetadata <- dfR_var %>% DataFrame
             """
             )
             objR = R("objR")
@@ -556,6 +565,17 @@ def so2ad(so, assay=None, verbose=0, rEnv=None, skipScaleMtx=False, **kwargs):
     else:
         for obsp in R("names(so@graphs)"):
             ad.obsp[obsp] = r2py(R(f"so@graphs${obsp} %>% as.sparse"), verbose=verbose)
+    
+    # add hvg info
+    haveVarGene = R("VariableFeatures")(so, assay=assay) >> F(R("length")) >> F(R("\(x) {x>0}")) >> F(lambda x:x[0]) 
+    if haveVarGene:
+        ls_var =  R("VariableFeatures")(so, assay=assay) >> F(list)
+        logger.info(f"assay {assay}: Variable features are already calculated. {len(ls_var)} features are selected.")
+        dt_var = {ls_var[i]:i for i in range(len(ls_var))}
+        ad.var['highly_variable'] = ad.var.index.isin(dt_var)
+        ad.var['highly_variable_rank'] = ad.var.index.map(lambda x:dt_var.get(x, np.nan))
+    else:
+        logger.info(f"assay {assay}: No variable features are calculated. Pass")
     return ad
 
 
@@ -579,6 +599,9 @@ def so2md(so, rEnv=None, verbose=0, **kwargs):
             ad_scale = sc.AnnData(df_layer)
             ad_scale.layers[f"{assay}_scale.data"] = ad_scale.X
             ad_scale.X = ss.csc_matrix(ad_scale.shape)
+            if "highly_variable" in ad.var:
+                ad_scale.var["highly_variable"] = ad.var["highly_variable"]
+                ad_scale.var["highly_variable_rank"] = ad.var["highly_variable_rank"]
             dtAd[f"{assay}_scale.data"] = ad_scale
     md = mu.MuData(dtAd, axis=-1)
     return md
@@ -632,7 +655,7 @@ class Trl:
         objName = objName[::-1]
         for line in inspect.getframeinfo(inspect.currentframe().f_back)[3]:
             line = line[::-1]
-            m = re.search(rf"\b{objName}\s*\|\s*(\w+?)\s*[\W]", line)
+            m = re.search(rf"\b{objName}\s*\|\s*(\w+)[\s\W]*", line)
             if m:
                 name = m.group(1)[::-1]
                 break
@@ -643,7 +666,6 @@ class Trl:
 
 def rGet(objR, *attrs):
     import rpy2.robjects as ro
-
     _ = objR
     for attr in attrs:
         if attr[0] in ["@", "$"]:
@@ -714,3 +736,10 @@ def r2py_re(objR):
     del rEnv["temp_r2py"]
     return obj
 
+def RR(script):
+    R = ro.r
+    return R(f"\(x) {script}")
+
+def FR(script):
+    R = ro.r
+    return F(R(script))

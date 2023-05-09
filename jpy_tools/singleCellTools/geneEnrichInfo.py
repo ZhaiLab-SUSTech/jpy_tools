@@ -498,7 +498,24 @@ def calculateEnrichScoreByCellex(
                 right_on=["gene", clusterName],
             )
         )
+
+        _lsSr = []
+        for key, _df in eso.results.items():
+            _ls = key.split('.')
+            if len(_ls) == 1:
+                continue
+            method, attr = _ls
+            if attr not in ['pvals', 'esw_s']:
+                continue
+            _lsSr.append(_df.stack().rename(f"{method}_{attr}"))
+        df_others = pd.concat(_lsSr,axis=1).reset_index().rename({'level_0': 'gene', 'level_1': clusterName}, axis=1)
+        df_others['significantCounts'] = (df_others.filter(like='pvals') < 0.05).sum(1)
+        df_result = df_result.merge(df_others, left_on=['gene', clusterName], right_on=['gene', clusterName], how='left')
+        df_result[clusterName] = df_result[clusterName].astype('category').cat.set_categories(ls_cluster)
+        # adata.uns[f"{kayAddedPrefix}_cellex_all"] = df_others.copy()
+
         adata.uns[f"{kayAddedPrefix}_cellexES"] = df_result.copy()
+
 
     adata = adata.copy() if copy else adata
     basic.testAllCountIsInt(adata, layer)
@@ -620,7 +637,6 @@ def getEnrichedGeneByCellId(
         sc.pp.scale(_ad, layer=layer, max_value=10)
     adataR = py2r(_ad)
     adataR = cellId.RunMCA(adataR, slot=layer, nmcs=nmcs)
-
     VectorR_marker = cellId.GetGroupGeneSet(
         adataR,
         group_by=clusterName,
@@ -965,6 +981,7 @@ def getAUCellScore(
     calcThreshold=False,
     thresholdsHistCol=5,
     dt_kwargs2aucell={},
+    chunksize=10000,
     **dt_kwargs,
 ):
     '''It takes a list of gene sets, and calculates the AUCell score for each gene set
@@ -1006,8 +1023,6 @@ def getAUCellScore(
     ), "aucMaxRank and aucMaxPropotion cannot be specified at the same time"
     if not aucMaxRank is None:
         aucMaxPropotion = aucMaxRank / ad.shape[1]
-    
-    df_mtx = basic.ad2df(ad, layer)
 
     df_pseudoMotif = pd.DataFrame(
         columns=[
@@ -1060,15 +1075,36 @@ def getAUCellScore(
         >> F(list)
     )
 
-    df_auc = aucell(
-        df_mtx,
-        signatures=ls_reg,
-        auc_threshold=aucMaxPropotion,
-        num_workers=threads,
-        noweights=True,
-        seed=0,
-        **dt_kwargs2aucell,
-    )
+    if chunksize is None:
+        df_mtx = basic.ad2df(ad, layer)
+        df_auc = aucell(
+            df_mtx,
+            signatures=ls_reg,
+            auc_threshold=aucMaxPropotion,
+            num_workers=threads,
+            noweights=True,
+            seed=0,
+            **dt_kwargs2aucell,
+        )
+    else:
+        maxIter = int(np.ceil(ad.shape[0] / chunksize))
+        lsDf_auc = []
+        for i in tqdm(range(0, ad.shape[0], chunksize)):
+            _df_mtx = basic.ad2df(ad[i:i+chunksize], layer)
+            # _df_mtx = _df_mtx.iloc[i:i+chunksize]
+            _df_auc = aucell(
+                _df_mtx,
+                signatures=ls_reg,
+                auc_threshold=aucMaxPropotion,
+                num_workers=threads,
+                noweights=True,
+                seed=0,
+                **dt_kwargs2aucell,
+            )
+            lsDf_auc.append(_df_auc)
+            import gc;gc.collect()
+        df_auc = pd.concat(lsDf_auc)
+
     # import pdb;pdb.set_trace()
     ad.obsm[label] = df_auc.reindex(ad.obs.index)
 
@@ -2003,3 +2039,52 @@ def getLigrecPairCounts(
         .rename_axis(index="source", columns="target")
     )
     return df_pairCounts
+
+
+def getGeneMeanAndExpressedRatio(ad:sc.AnnData, layer='raw', prefix=None) -> None:
+    '''
+    Parameters
+    ----------
+    ad : sc.AnnData
+        the AnnData object
+    layer, optional
+        the layer of the AnnData object to use for the calculation
+    prefix
+        the prefix of the new columns. If None, the prefix will be 'mean' and 'expressedRatio'
+    
+    '''
+    import scipy.sparse as ss
+    if isinstance(ad.layers[layer], (ss.csr_matrix, ss.csc_matrix)):
+        data = ss.csc_array(ad.layers[layer])
+    else:
+        data = ad.layers[layer]
+    if prefix is None:
+        prefix = ''
+    ad.var[f'{prefix}mean'] = data.mean(axis=0)
+    ad.var[f'{prefix}expressedRatio'] = (data > 0).mean(axis=0)
+    ad.var[f'{prefix}expressedCount'] = (data > 0).sum(axis=0)
+
+
+def getGeneMeanAndExpressedRatioGroups(ad:sc.AnnData, groupby:Union[str, List[str]], layer='raw'):
+    '''It takes a single cell RNA-seq dataset, groups the cells by a categorical variable, and update the mean expression of each gene in each group, and the ratio of cells expressing
+    each gene in each group
+    
+    Parameters
+    ----------
+    ad : sc.AnnData
+        sc.AnnData: the AnnData object
+    groupby : Union[str, List[str]]
+        the column name in ad.obs that you want to group by.
+    layer, optional
+        the layer of the AnnData object to use for the analysis.
+    
+    '''
+    if isinstance(groupby, str):
+        groupby = [groupby]
+    for group in groupby:
+        for sample in ad.obs[group].unique():
+            _ad = ad[ad.obs[group] == sample].copy()
+            getGeneMeanAndExpressedRatio(_ad, layer=layer, prefix=f'{group}_{sample}_')
+            ad.var.loc[_ad.var.index, f'{group}_{sample}_mean'] = _ad.var[f'{group}_{sample}_mean']
+            ad.var.loc[_ad.var.index, f'{group}_{sample}_expressedRatio'] = _ad.var[f'{group}_{sample}_expressedRatio']
+            ad.var.loc[_ad.var.index, f'{group}_{sample}_expressedCount'] = _ad.var[f'{group}_{sample}_expressedCount']

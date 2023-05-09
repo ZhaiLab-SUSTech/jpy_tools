@@ -252,6 +252,7 @@ def normalizeBySCT_r(
     returnSo = False,
     rEnv = None,
     debug = False,
+    runSctOnly = False,
     **dt_kwargsToSct,
 ):
     '''`normalizeBySCT_r` is a function that takes in a single-cell RNA-seq dataset and returns a
@@ -280,6 +281,7 @@ def normalizeBySCT_r(
     import rpy2
     import rpy2.robjects as ro
     from rpy2.robjects.packages import importr
+    import pickle
     from ..rTools import ad2so, so2ad, so2md
     from ..otherTools import F
 
@@ -290,6 +292,33 @@ def normalizeBySCT_r(
 
     R = ro.r
     setSeed()
+    def setSctVstToAd(ad, rEnv):
+        model = R("levels(x = so_sct[['SCT']])")
+        assert len(list(model)) == 1, "model must be 1"
+        R("""
+        SCTModel_to_vst <- function(SCTModel) {
+            feature.params <- c("theta", "(Intercept)",  "log_umi")
+            feature.attrs <- c("residual_mean", "residual_variance" )
+            vst_out <- list()
+            vst_out$model_str <- slot(object = SCTModel, name = "model")
+            vst_out$model_pars_fit <- as.matrix(x = slot(object = SCTModel, name = "feature.attributes")[, feature.params])
+            vst_out$gene_attr <- slot(object = SCTModel, name = "feature.attributes")[, feature.attrs]
+            vst_out$cell_attr <- slot(object = SCTModel, name = "cell.attributes")
+            vst_out$arguments <- slot(object = SCTModel, name = "arguments")
+            return(vst_out)
+            }
+
+        model = levels(x = so_sct[['SCT']])
+
+        clip_range = SCTResults(object = so_sct[["SCT"]], slot = "clips", model = "model1")$sct
+        vst_out <- SCTModel_to_vst(SCTModel = slot(object = so_sct[['SCT']], name = "SCTModel.list")[[model]])
+        """)
+        vst_out = rEnv['vst_out']
+        ad.uns['sct_vst_pickle'] = str(pickle.dumps(vst_out))
+        ad.uns['sct_clip_range'] = list(rEnv['clip_range'])
+
+
+
     so = ad2so(ad, layer=layer, lightMode=True)
     if debug:
         import pdb;pdb.set_trace()
@@ -312,16 +341,30 @@ def normalizeBySCT_r(
     """
     )
     so_sct = rEnv["so_sct"]
+    setSctVstToAd(ad, rEnv)
     ls_hvg = list(rEnv["ls_hvg"])
+    
+    ls_var =  R("VariableFeatures")(so_sct, assay='SCT') >> F(list)
+    dt_var = {ls_var[i]:i for i in range(len(ls_var))}
+    ad.var['highly_variable'] = ad.var.index.isin(dt_var)
+    ad.var['highly_variable_rank'] = ad.var.index.map(lambda x:dt_var.get(x, np.nan))
+    if runSctOnly:
+        return ad
+
+    
     md_sct = so2md(so_sct)
     md_sct['SCT_scale.data'].var['highly_variable'] = md_sct['SCT_scale.data'].var.index.isin(ls_hvg)
     md_sct['SCT_scale.data'].X = md_sct['SCT_scale.data'].layers['SCT_scale.data']
+    md_sct.uns["sct_vst_pickle"] = ad.uns["sct_vst_pickle"]
+    md_sct.uns["sct_clip_range"] = ad.uns["sct_clip_range"]
+
     sc.tl.pca(md_sct['SCT_scale.data'])
     ad.obsm['X_pca_sct'] = md_sct['SCT_scale.data'].obsm['X_pca'].copy()
     ad.uns['pca_sct'] = md_sct['SCT_scale.data'].uns['pca'].copy()
-    ad.var['highly_variable'] = ad.var.index.isin(ls_hvg)
     ad.obsm['SCT_data'] = md_sct['SCT'].layers['SCT_data']
     ad.uns['SCT_data_features'] = md_sct['SCT'].var.index.to_list()
+    
+
 
     # ad_sct = so2ad(so_sct, verbose=0)
     # ad_sct.var['highly_variable'] = ad_sct.var.index.isin(ls_hvg)
@@ -346,7 +389,56 @@ def normalizeBySCT_r(
         return md_sct
     
     
+def getHvgGeneFromSctAdata(ls_ad, nTopGenes=3000, nTopGenesEachAd=3000):
+    '''> get the top  HVGs that are shared across all adatas
 
+    Parameters
+    ----------
+    ls_ad
+        a list of adata objects, must be `data` slot. Gene listed in all adata objects will be used.
+    nTopGenes, optional
+        the total number of genes to use for the analysis
+    nTopGenesEachAd, optional
+        the number of HVGs to use from each adata object
+
+    Returns
+    -------
+        A list of genes that are highly variable across all adatas.
+
+    '''
+    for ad in ls_ad:
+        assert 'highly_variable_rank' in ad.var.columns, "adata must have highly_variable_rank"
+    ls_allGenes = []
+    for ad in ls_ad:
+        ls_allGenes.extend(ad.var.index.to_list())
+    ls_allGenes = pd.Series(ls_allGenes).value_counts().loc[lambda x: x == len(ls_ad)].index.to_list()
+    
+
+    ls_allHvg = []
+    for ad in ls_ad:
+        _t = True
+        ls_allHvg.extend(ad.var.query("highly_variable == @_t").sort_values('highly_variable_rank').index[:nTopGenesEachAd].to_list())
+    ls_allHvg = [x for x in ls_allHvg if x in ls_allGenes]
+    assert len(set(ls_allHvg)) > nTopGenes, "nTopGenes must be smaller than total number of HVGs"
+    ls_hvgCounts = pd.Series(ls_allHvg).value_counts()
+
+    ls_usedHvg = []
+    for hvgCounts in range(len(ls_ad), 0, -1):
+        ls_currentCountsHvg = ls_hvgCounts[ls_hvgCounts == hvgCounts].index.to_list()
+        if (len(ls_usedHvg) + len(ls_currentCountsHvg)) > nTopGenes:
+            break
+        ls_usedHvg.extend(ls_currentCountsHvg)
+
+    needAnotherCounts = nTopGenes - len(ls_usedHvg)
+    df_remainGeneRank = pd.DataFrame(index=list(set(ls_allGenes) - set(ls_usedHvg)))
+    for i,ad in enumerate(ls_ad):
+        df_remainGeneRank[f"{i}"] = ad.var['highly_variable_rank']
+    df_remainGeneRank = df_remainGeneRank.sort_index()
+    df_remainGeneRank['count'] = pd.notna(df_remainGeneRank).sum(1)
+    df_remainGeneRank['median'] = df_remainGeneRank.drop(columns='count').apply('median', axis=1)
+    df_remainGeneRank = df_remainGeneRank.sort_values(['count', 'median'], ascending=[False, True])
+    ls_usedHvg.extend(df_remainGeneRank.iloc[:needAnotherCounts].index.to_list())
+    return ls_usedHvg, df_remainGeneRank
 
 def normalizeBySCT(
     adata: anndata.AnnData,
@@ -414,7 +506,6 @@ def normalizeBySCT(
     Optional[anndata.AnnData]
         [description]
     """
-
     import scipy.sparse as ss
     import pysctransform
     import scanpy as sc
@@ -487,6 +578,36 @@ def normalizeBySCT(
     if copy:
         return adata
 
+def getSctResiduals(ad, ls_gene, layer='raw', forceOverwrite=False):
+    import pickle
+    from ..rTools import py2r, r2py
+    from ..otherTools import F
+
+    basic.testAllCountIsInt(ad, layer)
+    assert 'sct_vst_pickle' in ad.uns, "sct_vst_pickle not found in adata.uns"
+    assert 'sct_clip_range' in ad.uns, "sct_clip_range not found in adata.layers"
+    import rpy2.robjects as ro
+    R = ro.r
+
+    if ('sct_residual' not in ad.obsm.keys()) or forceOverwrite:
+        ls_gene = ls_gene
+    else:
+        ls_gene = list(set(ls_gene) - set(ad.obsm['sct_residual'].columns))
+    if len(ls_gene) == 0:
+        return None
+
+    fcR_getResiduals = R("sctransform::get_residuals")
+    vst_out = pickle.loads(eval(ad.uns['sct_vst_pickle']))
+    ls_clipRange = list(ad.uns['sct_clip_range'])
+    df_residuals = fcR_getResiduals(vst_out, umi=ad[:, ls_gene].to_df(layer).T >> F(py2r) >> F(R("data.matrix")) >> F(R("Matrix::Matrix")), res_clip_range=R.c(*ls_clipRange)) >> F(R("as.data.frame")) >> F(r2py)
+    df_residuals = df_residuals.T
+    df_residuals = df_residuals - df_residuals.mean()
+    if ('sct_residual' not in ad.obsm.keys()) or forceOverwrite:
+        ad.obsm['sct_residual'] = df_residuals
+    else:
+        ad.obsm['sct_residual'] = pd.concat([ad.obsm['sct_residual'], df_residuals], axis=1)
+
+
 @rcontext
 def integrateBySeurat(
     ad: anndata.AnnData,
@@ -500,6 +621,7 @@ def integrateBySeurat(
     k_filter=200,
     k_weight=100,
     identify_top_genes_by_seurat=False,
+    dt_integrateDataParams={},
     saveSeurat=None,
     rEnv = None,
 ) -> sc.AnnData:
@@ -559,16 +681,19 @@ def integrateBySeurat(
     if identify_top_genes_by_seurat:
         lsR_features = n_top_genes
     else:
-        sc.pp.highly_variable_genes(
-            ad,
-            layer=layer,
-            batch_key=batch_key,
-            n_top_genes=n_top_genes,
-            flavor="seurat_v3",
-        )
-        ls_features = ad.var.loc[ad.var["highly_variable"]].index.to_list() | F(
-            lambda z: [x.replace("_", "-") for x in z]
-        )  # seurat always use dash to separate gene names
+        if isinstance(n_top_genes, int):
+            sc.pp.highly_variable_genes(
+                ad,
+                layer=layer,
+                batch_key=batch_key,
+                n_top_genes=n_top_genes,
+                flavor="seurat_v3",
+            )
+            ls_features = ad.var.loc[ad.var["highly_variable"]].index.to_list() | F(
+                lambda z: [x.replace("_", "-") for x in z]
+            )  # seurat always use dash to separate gene names
+        else:
+            ls_features = n_top_genes | F(lambda z: [x.replace("_", "-") for x in z])
         lsR_features = R.c(*ls_features)
 
     so = ad2so(ad, layer=layer, ls_obs=[batch_key])
@@ -584,7 +709,7 @@ def integrateBySeurat(
     rEnv["dims"] = dims
     rEnv["k.filter"] = k_filter
     rEnv["k.weight"] = k_weight
-
+    rEnv["dtR_integrateDataParams"] = R.list(**dt_integrateDataParams)
     R(
         """
     so.list <- SplitObject(so, split.by = batch_key)
@@ -644,11 +769,14 @@ def integrateBySeurat(
             )
     else:
         assert False, f"unknown normalization method : {normalization_method}"
-
     R(
         """
     so.anchors <- FindIntegrationAnchors(object.list = so.list, anchor.features = lsR_features, reduction = reduction, normalization.method = normalization.method, dims = 1:dims, k.score = k.score, k.filter = k.filter)
-    so.combined <- IntegrateData(anchorset = so.anchors, normalization.method = normalization.method, dims = 1:dims, k.weight=k.weight)
+    dtR_integrateDataParams$anchorset <- so.anchors
+    dtR_integrateDataParams$`normalization.method` <- normalization.method
+    dtR_integrateDataParams$dims <- 1:dims
+    dtR_integrateDataParams$`k.weight` <- k.weight
+    so.combined <- DescTools::DoCall(IntegrateData, dtR_integrateDataParams)
     """
     )
     if not saveSeurat is None:

@@ -30,6 +30,7 @@ from tempfile import NamedTemporaryFile
 import collections
 from xarray import corr
 import sys
+import snapatac2 as snap
 from . import basic
 
 
@@ -588,3 +589,113 @@ def getClusterRobustness_reclustering(
 
     return df_clusterRes, df_ari
 
+def saveAdToLmdb(ad, outputPath, ls_saveObsKey, ls_pseudoBulkUse, forceDense, batchSize=100):
+    '''It takes an AnnData object, and saves it to a directory in LMDB format
+
+    Parameters
+    ----------
+    ad
+        AnnData object
+    outputPath
+        the path to save the output files
+    ls_saveObsKey
+        a list of keys in ad.obs that you want to save.
+    ls_pseudoBulkUse
+        a list of columns in ad.obs that will be used to create the pseudo-bulk data.
+    
+    Notes
+    ----------
+    sparse matrix will be stored by following scripts:
+        a = ss.coo_array(a)
+        value = pickle.dumps((a.data, a.row, a.col, a.shape))
+    The saved data will be loaded by following scripts:
+        data, row, col, shape = pickle.loads(value)
+        a = ss.coo_matrix((data, (row, col)), shape=shape)
+    '''
+    import lmdb
+    import tqdm
+    import pickle
+    import gc
+    from . import geneEnrichInfo, basic
+
+    # save gene (cell)
+    env = lmdb.open(f"{outputPath}/cell/", map_size=1099511627776)
+    txn = env.begin(write=True)
+
+    value = pickle.dumps(ad.obsm['X_umap'][:, 0])
+    txn.put(key='x'.encode(), value=value)
+    logger.info(f"save UMAP_1 to x")
+
+    value = pickle.dumps(ad.obsm['X_umap'][:, 1])
+    txn.put(key='y'.encode(), value=value)
+    logger.info(f"save UMAP_2 to y")
+
+    value = pickle.dumps(ad.var.index.values)
+    txn.put(key='all_gene'.encode(), value=value)
+    logger.info(f"save all gene's names to all_gene")
+
+    value = pickle.dumps(ad.obs.index.values)
+    txn.put(key='all_cell'.encode(), value=value)
+    logger.info(f"save all cell's names to all_cell")
+
+    for key in ls_saveObsKey:
+        value = pickle.dumps(ad.obs[key].values)
+        txn.put(key=key.encode(), value=value)
+        logger.info(f"save {key} to {key}")
+
+    for i, gene in tqdm.tqdm(enumerate(ad.var.index), total=len(ad.var.index)):
+        if forceDense:
+            value = pickle.dumps(ad[:, gene].layers['normalize_log'].A.reshape(-1))
+        else:
+            coo_exp = ad[:, gene].layers['normalize_log'].tocoo()
+            value = pickle.dumps((coo_exp.data, coo_exp.row, coo_exp.col, coo_exp.shape))
+        txn.put(key=gene.encode(), value=value)
+        if i % batchSize == 0:
+            txn.commit()
+            txn = env.begin(write=True)
+            gc.collect()
+
+    txn.commit()
+    env.close()
+
+    ad_bulk = geneEnrichInfo._mergeData(ad, ls_pseudoBulkUse)
+    basic.initLayer(ad_bulk, total=1e6)
+
+    # save gene (pseudo-bulk)
+    env = lmdb.open(f"{outputPath}/pseudo_bulk/", map_size=1099511627776)
+    txn = env.begin(write=True)
+
+    value = pickle.dumps(ad_bulk.var.index.values)
+    txn.put(key='all_gene'.encode(), value=value)
+    logger.info(f"save all gene's names to all_gene")
+
+    value = pickle.dumps(ad_bulk.obs.index.values)
+    txn.put(key='all_cell'.encode(), value=value)
+    logger.info(f"save all cell's names to all_cell")
+
+    for key in ls_pseudoBulkUse:
+        value = pickle.dumps(ad_bulk.obs[key].values)
+        txn.put(key=key.encode(), value=value)
+
+    for gene in tqdm.tqdm(ad_bulk.var.index):
+        value = pickle.dumps(ad_bulk[:, gene].layers['normalize_log'].reshape(-1))
+        txn.put(key=gene.encode(), value=value)
+
+    txn.commit()
+    env.close()
+
+
+def subsetBackedAd(ad:snap.AnnData, ls_obs, ls_var) -> sc.AnnData:
+    from tempfile import NamedTemporaryFile
+    tempFile = NamedTemporaryFile()
+
+    if isinstance(ls_obs, str):
+        ls_obs = [ls_obs]
+    if isinstance(ls_var, str):
+        ls_var = [ls_var]
+        
+    ad1 = ad.subset(ls_obs, ls_var, tempFile.name)
+    ad_subset = ad1.to_memory()
+    ad1.close()
+    tempFile.close()
+    return ad_subset

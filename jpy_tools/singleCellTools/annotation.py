@@ -31,6 +31,7 @@ import collections
 from xarray import corr
 from . import basic
 from ..rTools import rcontext
+from ..otherTools import F
 
 
 @rcontext
@@ -533,7 +534,7 @@ def labelTransferByScanpy(
     if needLoc:
         return ad_concat
 
-
+@rcontext
 def labelTransferBySeurat(
     ad_ref: sc.AnnData,
     refLabel: str,
@@ -545,7 +546,7 @@ def labelTransferBySeurat(
     dims=30,
     kWeight=100,
     refIsIntegrated=False,
-    renv=None,
+    rEnv=None,
 ) -> anndata.AnnData:
     """
     annotate queryAd based on refAd annotation result.
@@ -575,7 +576,6 @@ def labelTransferBySeurat(
     anndata.AnnData
         intregated anndata
     """
-
     import rpy2
     import rpy2.robjects as ro
     from rpy2.robjects.packages import importr
@@ -590,13 +590,9 @@ def labelTransferBySeurat(
     seuratObject = importr("SeuratObject")
     setSeed(0)
 
-    if renv is None:
-        renv = ro.Environment()
-
     if not refIsIntegrated:
         ad_ref.layers["_raw"] = ad_ref.layers[refLayer].copy()
         ad_query.layers["_raw"] = ad_query.layers[queryLayer].copy()
-
         ad_concat = sc.concat(
             {"ref": ad_ref, "query": ad_query}, label="seurat_", index_unique="-"
         )
@@ -609,27 +605,24 @@ def labelTransferBySeurat(
             flavor="seurat_v3",
         )
         ls_features = ad_concat.var.index.str.replace("_", "-").to_list()
-
         so_ref = ad2so(ad_ref, refLayer, ls_obs=refLabel)
         so_query = ad2so(ad_query, queryLayer, ls_obs=[])
         lsR_features = R.c(*ls_features)
+        rEnv["so_ref"] = so_ref
+        rEnv["so_query"] = so_query
+        rEnv["lsR_features"] = lsR_features
+        rEnv["k.score"] = kScore
+        rEnv["dims"] = dims
+        rEnv["k.weight"] = kWeight
 
-        with ro.local_context(renv) as rlc:
-            rlc["so_ref"] = so_ref
-            rlc["so_query"] = so_query
-            rlc["lsR_features"] = lsR_features
-            rlc["k.score"] = kScore
-            rlc["dims"] = dims
-            rlc["k.weight"] = kWeight
+        R(
+            f"""
+        anchors <- FindTransferAnchors(reference = so_ref, query = so_query, dims = 1:dims, k.score=k.score,features=lsR_features)
+        predictions <- TransferData(anchorset = anchors, refdata = so_ref${refLabel}, dims = 1:dims, k.weight=k.weight)
+        """
+        )
 
-            R(
-                f"""
-            anchors <- FindTransferAnchors(reference = so_ref, query = so_query, dims = 1:dims, k.score=k.score,features=lsR_features)
-            predictions <- TransferData(anchorset = anchors, refdata = so_ref${refLabel}, dims = 1:dims, k.weight=k.weight)
-            """
-            )
-
-        df_pred = r2py(rlc["predictions"])
+        df_pred = r2py(rEnv["predictions"])
 
         ad_query.obsm[f"labelTransfer_seurat_{refLabel}"] = df_pred
         ad_query.obs[f"labelTransfer_seurat_{refLabel}"] = df_pred["predicted.id"]
@@ -664,7 +657,6 @@ def labelTransferBySeurat(
             size=12e4 / len(ad_concat),
             ax=ax,
         )
-        renv.clear()
     else:
         ad_ref = ad_ref.copy()
         ad_ref.var.index = ad_ref.var.index.str.replace("_", "-")
@@ -676,28 +668,28 @@ def labelTransferBySeurat(
             ), "Not support SCT normalization, please rerun SCT and NOT transfer `seuratObject` to `AnnData` until label transfer is finished"
         else:
             refScaleLayer = None
-        with ro.local_context() as rlc:
-            so_ref = ad2so(
-                ad_ref,
-                layer=refLayer,
-                dataLayer="seurat_integrated_data",
-                scaleLayer=refScaleLayer,
-            )
-            so_query = ad2so(ad_query, layer=queryLayer)
-            rlc["so_ref"] = so_ref
-            rlc["so_query"] = so_query
-            rlc["k.score"] = kScore
-            rlc["dims"] = dims
-            rlc["k.weight"] = kWeight
-            rlc["lsR_features"] = R.c(*ad_ref.var.index.str.replace("_", "-").to_list())
-            R(
-                f"""
-            anchors <- FindTransferAnchors(reference = so_ref, query = so_query, dims = 1:dims, k.score=k.score, features=lsR_features)
-            predictions <- TransferData(anchorset = anchors, refdata = so_ref${refLabel}, dims = 1:dims, k.weight=k.weight)
-            """
-            )
 
-        df_pred = r2py(rlc["predictions"])
+        so_ref = ad2so(
+            ad_ref,
+            layer=refLayer,
+            dataLayer="seurat_integrated_data",
+            scaleLayer=refScaleLayer,
+        )
+        so_query = ad2so(ad_query, layer=queryLayer)
+        rEnv["so_ref"] = so_ref
+        rEnv["so_query"] = so_query
+        rEnv["k.score"] = kScore
+        rEnv["dims"] = dims
+        rEnv["k.weight"] = kWeight
+        rEnv["lsR_features"] = R.c(*ad_ref.var.index.str.replace("_", "-").to_list())
+        R(
+            f"""
+        anchors <- FindTransferAnchors(reference = so_ref, query = so_query, dims = 1:dims, k.score=k.score, features=lsR_features)
+        predictions <- TransferData(anchorset = anchors, refdata = so_ref${refLabel}, dims = 1:dims, k.weight=k.weight)
+        """
+        )
+
+        df_pred = r2py(rEnv["predictions"])
 
         ad_query.obsm[f"labelTransfer_seurat_{refLabel}"] = df_pred
         ad_query.obs[f"labelTransfer_seurat_{refLabel}"] = df_pred["predicted.id"]
@@ -723,60 +715,86 @@ def labelTransferByScanvi(
     cutoff: float = 0.95,
     keyAdded: Optional[str] = None,
     max_epochs: int = 1000,
+    max_epochs_scanvi: Optional[int] = None,
+    max_epochs_update: Optional[int] = None,
     threads: int = 24,
     mode: Literal["merge", "online"] = "online",
     n_top_genes=3000,
     early_stopping: bool = True,
     batch_size_ref: int = 128,
     batch_size_query: int = 128,
-    hvgBatch=None,
+    hvgBatch='',
 ) -> Optional[anndata.AnnData]:
     """
-    annotate queryAd based on refAd annotation result.
-
+    Performs label transfer from a reference dataset to a query dataset using the scanvi library.
+        
     Parameters
     ----------
-    refAd : anndata.AnnData
-    refLabel : str
-    refLayer : str
-        raw count
-    queryAd : anndata.AnnData
-    queryLayer : str
-        raw count
-    needLoc : bool, optional
-        if True, and `copy` is False, integrated anndata will be returned. by default False
-    ls_removeCateKey : Optional[List[str]], optional
-        These categories will be removed, the first one must be 'batch', by default []
-    dt_params2Model : dict, optional
-        by default {}
-    cutoff : float, optional
-        by default 0.9
-    keyAdded : Optional[str], optional
-        by default None
-    max_epochs : int, optional
-        by default 1000
-    threads : int, optional
-        by default 24
-    mode: Literal['merge', 'online']
-        by default 'online'
-
-    Returns
-    -------
-    Optional[anndata.AnnData]
-        based on needloc
+    refAd: anndata.AnnData
+        The reference dataset.
+    refLabel: str
+        The categorical column name in the reference dataset to use for labels.
+    refLayer: str
+        The layer to filter the reference dataset by.
+    queryAd: anndata.AnnData
+        The query dataset.
+    queryLayer: str
+        The layer to filter the query dataset by.
+    needLoc: bool, optional
+        If True, modifies the original queryAd object in place and returns None. Otherwise, returns an AnnData object with the transferred labels added.
+        Default is False.
+    ls_removeCateKey: List[str], optional
+        A list of categorical column names to remove from both refAd and queryAd before performing the label transfer.
+        Default is [].
+    dt_params2SCVIModel: dict, optional
+        A dictionary of parameters to pass to the SCVI model when training it.
+        Default is {}.
+    dt_params2SCANVIModel: dict, optional
+        A dictionary of parameters to pass to the SCANVI model when training it.
+        Default is {}.
+    cutoff: float, optional
+        The minimum probability required for a cell to be labeled.
+        Must be a float value between 0 and 1.
+        Default is 0.95.
+    keyAdded: str, optional
+        The name of the column to use for the transferred labels in the returned AnnData object.
+        Default is None.
+    max_epochs: int, optional
+        The maximum number of epochs to use for training the SCVI and SCANVI models.
+        Default is 1000.
+    threads: int, optional
+        The number of threads to use.
+        Default is 24.
+    mode: str, optional
+        The mode of operation, either "merge" or "online".
+        Default is "online".
+    n_top_genes: int, optional
+        The number of top genes to use.
+        Default is 3000.
+    early_stopping: bool, optional
+        Whether to use early stopping when training the models.
+        Default is True.
+    batch_size_ref: int, optional
+        an integer specifying the batch size to use when training the SCANVI model on the reference data.
+        Default is 128.
+    batch_size_query: int, optional
+        an integer specifying the batch size to use when training the SCANVI model on the query data.
+        Default is 128.
+    hvgBatch: str, optional
+        a string specifying a batch column name to use for highly variable gene selection.
     """
     scvi.settings.seed = 39
     scvi.settings.num_threads = threads
-    if not hvgBatch:
-        hvgBatch = ls_removeCateKey[0]
+
 
     queryAdOrg = queryAd
-    refAd = basic.getPartialLayersAdata(refAd, refLayer, [refLabel, *ls_removeCateKey])
-    queryAd = basic.getPartialLayersAdata(queryAd, queryLayer, ls_removeCateKey)
+    refAd = basic.getPartialLayersAdata(refAd, refLayer, [refLabel, *ls_removeCateKey, hvgBatch] >> F(filter, lambda x: x) >> F(set) >> F(list))
+    queryAd = basic.getPartialLayersAdata(queryAd, queryLayer, [*ls_removeCateKey, hvgBatch] >> F(filter, lambda x: x) >> F(set) >> F(list))
     refAd, queryAd = basic.getOverlap(refAd, queryAd)
     if not ls_removeCateKey:
         ls_removeCateKey = ["_batch"]
-
+    if not hvgBatch:
+        hvgBatch = ls_removeCateKey[0]
     queryAd.obs[refLabel] = "unknown"
     refAd.obs["_batch"] = "ref"
     queryAd.obs["_batch"] = "query"
@@ -820,7 +838,7 @@ def labelTransferByScanvi(
         lvae = scvi.model.SCANVI.from_scvi_model(
             scvi_model, "unknown", **dt_params2SCANVIModel
         )
-        lvae.train(max_epochs=max_epochs, batch_size=batch_size_ref)
+        lvae.train(max_epochs=max_epochs_scanvi, batch_size=batch_size_ref)
         lvae.history["elbo_train"].plot()
         plt.yscale("log")
         plt.show()
@@ -848,7 +866,7 @@ def labelTransferByScanvi(
         lvae_online._unlabeled_indices = np.arange(queryAd.n_obs)
         lvae_online._labeled_indices = []
         lvae_online.train(
-            max_epochs=max_epochs,
+            max_epochs=max_epochs_update,
             plan_kwargs=dict(weight_decay=0.0),
             batch_size=batch_size_query,
         )
@@ -881,7 +899,7 @@ def labelTransferByScanvi(
             scvi_model, "unknown", **dt_params2SCANVIModel
         )
         lvae.train(
-            max_epochs=max_epochs,
+            max_epochs=max_epochs_scanvi,
             early_stopping=early_stopping,
             batch_size=batch_size_ref,
         )
@@ -973,13 +991,13 @@ def labelTransferByCelltypist(
     ad_ref : sc.AnnData
         the reference dataset
     refLayer : str
-        the layer in ad_ref that you want to use to train the model, e.g. "normalize_log"
+        the layer in ad_ref that you want to use to train the model. must be 'raw'
     refLabel : str
         the label you want to transfer
     ad_query : sc.AnnData
         the query data
     queryLayer : str
-        the layer in ad_query that you want to annotate,  e.g. "normalize_log"
+        the layer in ad_query that you want to annotate, must be 'raw'
     dt_kwargs2train
         parameters for training the model
     dt_kwargs2annotate
@@ -993,8 +1011,14 @@ def labelTransferByCelltypist(
 
     ad_queryOrg = ad_query
     ad_ref, ad_query = basic.getOverlap(ad_ref, ad_query)
+    ad_ref = ad_ref.copy()
+    ad_query = ad_query.copy()
     ad_ref.X = ad_ref.layers[refLayer]
+    sc.pp.normalize_total(ad_ref, target_sum=1e4)
+    sc.pp.log1p(ad_ref)
     ad_query.X = ad_query.layers[queryLayer]
+    sc.pp.normalize_total(ad_query, target_sum=1e4)
+    sc.pp.log1p(ad_query)
 
     if model is None:
         model = celltypist.train(ad_ref, labels=refLabel, **dt_kwargs2train)

@@ -37,21 +37,6 @@ from more_itertools import chunked
 import patchworklib as pw
 import scipy.sparse as ss
 from joblib import Parallel, delayed
-
-
-def show_figure(fig):
-
-    dummy = plt.figure()
-    new_manager = dummy.canvas.manager
-    new_manager.canvas.figure = fig
-    fig.set_canvas(new_manager.canvas)
-    fig.show()
-    plt.show()
-
-
-pw.show = show_figure
-
-
 from . import basic
 
 
@@ -78,11 +63,13 @@ def umapMultiBatch(
     cbRatio = 0.01,
     supTitleXPos = 0.5,
     disableSuptitle=False,
+    disableProgressBar=False,
 ):
     import gc
 
     if clearBk:
         pw.clear()
+        gc.collect()
     if isinstance(ls_gene, str):
         ls_gene = [ls_gene]
     if not ls_title:
@@ -92,7 +79,7 @@ def umapMultiBatch(
     if len(ls_gene) <= 1:
         disableProgressBar = True
     else:
-        disableProgressBar = False
+        disableProgressBar = disableProgressBar
     if groups[1] is None:
         groups[1] = ad.obs[groups[0]].astype("category").cat.categories.to_list()
     dt_adObs = ad.obs.groupby(groups[0]).apply(lambda df: df.index.to_list()).to_dict()
@@ -134,6 +121,13 @@ def umapMultiBatch(
             )
             plt.close()
             ls_ax.append(ax)
+
+        ax_add_count = len(ls_ax)%ncols
+        if ax_add_count != 0:
+            for count in range(ncols - ax_add_count):
+                ax_add = pw.Brick(figsize=figsize)
+                ax_add.axis('off')
+                ls_ax.append(ax_add)
         ls_ax = chunked(ls_ax, ncols) | F(list)
 
         _bc = pw.param["margin"]
@@ -141,10 +135,8 @@ def umapMultiBatch(
         if len(ls_ax) == 1:
             axs = pw.stack(ls_ax[0])
         else:
-            axs = pw.stack([pw.stack(x) for x in ls_ax[:-1]], operator="/")
+            axs = pw.stack([pw.stack(x) for x in ls_ax], operator="/")
             ls_name = list(axs.bricks_dict.keys())
-            for i, ax in enumerate(ls_ax[-1]):
-                axs = axs[ls_name[i]] / ax
 
         cmap = mpl.cm.get_cmap(cmap)
         norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
@@ -182,7 +174,7 @@ def umapMultiBatch(
         return axs
 
 
-def saveUmapMultiBatch(ad, threads, batchSize, ls_gene, ls_title, layer, backend = 'loky', **dt_kwargs):
+def saveUmapMultiBatch(ad, threads, batchSize, ls_gene, ls_title, layer, backend = 'multiprocessing', **dt_kwargs):
     from more_itertools import chunked, sliced
 
     def _iterAd(ad, batchSize, ls_gene, ls_title, layer):
@@ -326,12 +318,14 @@ def plotLabelPercentageInCluster(
             plt.sca(ax)
             legendHandleLs.append(
                 plt.Rectangle(
-                    (0, 0), 1, 1, fc=labelColor[singleLabel], edgecolor="none"
+                    (0, 0), 1, 1, fc=labelColor[singleLabel], edgecolor="none", label=singleLabel
                 )
             )
             legendLabelLs.append(singleLabel)
         legendHandleLs, legendLabelLs = legendHandleLs[::-1], legendLabelLs[::-1]
-        plt.legend(legendHandleLs, legendLabelLs, frameon=False, **dt_kwargsForLegend)
+        # plt.legend(legendHandleLs, legendLabelLs, frameon=False, **dt_kwargsForLegend)
+        plt.legend(handles=legendHandleLs, frameon=False, **dt_kwargsForLegend)
+
         plt.xlabel(groupby.capitalize())
         plt.ylabel(f"Percentage")
         if needCounts:
@@ -355,16 +349,18 @@ def plotLabelPercentageInCluster(
             plt.sca(ax)
             legendHandleLs.append(
                 plt.Rectangle(
-                    (0, 0), 1, 1, fc=labelColor[singleLabel], edgecolor="none"
+                    (0, 0), 1, 1, fc=labelColor[singleLabel], edgecolor="none", label=singleLabel
                 )
             )
             legendLabelLs.append(singleLabel)
-        plt.legend(
-            legendHandleLs[::-1],
-            legendLabelLs[::-1],
-            frameon=False,
-            **dt_kwargsForLegend,
-        )
+        # plt.legend(
+        #     legendHandleLs[::-1],
+        #     legendLabelLs[::-1],
+        #     frameon=False,
+        #     **dt_kwargsForLegend,
+        # )
+        plt.legend(handles=legendHandleLs[::-1], frameon=False, **dt_kwargsForLegend)
+
         plt.ylabel(groupby.capitalize())
         plt.xlabel(f"Percentage")
         if needCounts:
@@ -951,4 +947,121 @@ def plotGeneModuleByNetworkx(
         }
         nx.draw_networkx_labels(G, pos, dt_needLabelNodes, ax=ax, **dt_labelOptions)
     ax = plt.gca()
+    return ax
+
+def makeKdeForCluster(ad, key='Cluster', ls_cluster=None, levels=[0.1], ax=None, nobs=10000, palette=None, **dt_args):
+    '''> This function takes a `AnnData` object, a key in the `obs` attribute, a list of clusters, a list of levels, and a matplotlib axis object, and returns a matplotlib axis object with kdes drawn on it
+
+    Parameters
+    ----------
+    ad
+        AnnData object
+    key, optional
+        the column name of the cluster labels
+    ls_cluster
+        list of clusters to plot. If None, plot all clusters.
+    levels, optional
+        the levels to draw the kde
+    ax
+        the axis to plot on
+
+    '''
+    assert ax, 'Please provide an axis object'
+    if ls_cluster is None:
+        ls_cluster = ad.obs[key].unique().tolist()
+    if isinstance(ls_cluster, str):
+        ls_cluster = [ls_cluster]
+
+    if palette is None:
+        dt_colors = basic.getadataColor(ad, key)
+    else:
+        dt_colors = palette
+
+    _ad = ad[ad.obs.eval(f"{key} in @ls_cluster")]
+    df_umap = _ad.obs[[key]].assign(UMAP_1=list(_ad.obsm['X_umap'][:,0]), UMAP_2=list(_ad.obsm['X_umap'][:,1]))
+    nobs = min(nobs, df_umap.shape[0])
+    df_umap = df_umap.groupby(key, group_keys=False).apply(lambda x: x.sample(frac=nobs/df_umap.shape[0], random_state=39))
+
+    sns.kdeplot(df_umap, x='UMAP_1', y='UMAP_2', hue=key, levels=levels, common_norm=False, ax=ax, palette=dt_colors, **dt_args)
+
+def makeEllipseForCluster(ad, key='Cluster', ls_cluster=None, std=3, ax=None, **dt_args):
+    '''> This function takes a `AnnData` object, a key in the `obs` attribute, a list of clusters, a standard deviation, and a matplotlib axis object, and returns a matplotlib axis object with ellipses drawn on it
+
+    Parameters
+    ----------
+    ad
+        AnnData object
+    key, optional
+        the column name of the cluster labels
+    ls_cluster
+        list of clusters to plot. If None, plot all clusters.
+    std, optional
+        the number of standard deviations to determine the ellipse's radiuses.
+    ax
+        the axis to plot on
+
+    '''
+    from matplotlib.patches import Ellipse
+    import matplotlib.transforms as transforms
+
+    def confidence_ellipse(x, y, ax, n_std=3.0, facecolor='none', edgecolor='black', **kwargs):
+        """
+        Create a plot of the covariance confidence ellipse of *x* and *y*.
+
+        Parameters
+        ----------
+        x, y : array-like, shape (n, )
+            Input data.
+
+        ax : matplotlib.axes.Axes
+            The axes object to draw the ellipse into.
+
+        n_std : float
+            The number of standard deviations to determine the ellipse's radiuses.
+
+        **kwargs
+            Forwarded to `~matplotlib.patches.Ellipse`
+
+        Returns
+        -------
+        matplotlib.patches.Ellipse
+        """
+        if x.size != y.size:
+            raise ValueError("x and y must be the same size")
+
+        cov = np.cov(x, y)
+        pearson = cov[0, 1]/np.sqrt(cov[0, 0] * cov[1, 1])
+        # Using a special case to obtain the eigenvalues of this
+        # two-dimensional dataset.
+        ell_radius_x = np.sqrt(1 + pearson)
+        ell_radius_y = np.sqrt(1 - pearson)
+        ellipse = Ellipse((0, 0), width=ell_radius_x * 2, height=ell_radius_y * 2,
+                        facecolor=facecolor, edgecolor=edgecolor, **kwargs)
+
+        # Calculating the standard deviation of x from
+        # the squareroot of the variance and multiplying
+        # with the given number of standard deviations.
+        scale_x = np.sqrt(cov[0, 0]) * n_std
+        mean_x = np.mean(x)
+
+        # calculating the standard deviation of y ...
+        scale_y = np.sqrt(cov[1, 1]) * n_std
+        mean_y = np.mean(y)
+
+        transf = transforms.Affine2D() \
+            .rotate_deg(45) \
+            .scale(scale_x, scale_y) \
+            .translate(mean_x, mean_y)
+
+        ellipse.set_transform(transf + ax.transData)
+        return ax.add_patch(ellipse)
+    assert ax, 'Please provide an axis object'
+    if ls_cluster is None:
+        ls_cluster = ad.obs[key].unique().tolist()
+    if isinstance(ls_cluster, str):
+        ls_cluster = [ls_cluster]
+    for cluster in ls_cluster:
+        _ad = ad[ad.obs.eval("Cluster == @cluster")]
+
+        confidence_ellipse(_ad.obsm['X_umap'][:, 0], _ad.obsm['X_umap'][:, 1], ax, std, **dt_args)
     return ax
